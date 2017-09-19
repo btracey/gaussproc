@@ -62,11 +62,13 @@ type GP struct {
 	//cholK   *mat64.TriDense
 	cholK   *mat64.Cholesky
 	sigInvY *mat64.Vector
+
+	fixScaling bool
 }
 
 // New creates a new GP with the given input dimension, the given
 // kernel function, and output noise parameter. Output dim must be one.
-func New(inputDim int, kernel Kernel, noise float64) *GP {
+func New(inputDim int, kernel Kernel, noise float64, fixScaling bool, mean, std float64) *GP {
 	if inputDim <= 0 {
 		panic("gp: non-positive inputDim")
 	}
@@ -77,18 +79,28 @@ func New(inputDim int, kernel Kernel, noise float64) *GP {
 		panic("gp: negative noise") // also handles NaN.
 	}
 
-	return &GP{
-		kernel:   kernel,
-		noise:    noise,
-		inputDim: inputDim,
-		mean:     0,
-		std:      1,
-		inputs:   &mat64.Dense{},
-		outputs:  make([]float64, 0),
-		k:        mat64.NewSymDense(0, nil),
-		sigInvY:  &mat64.Vector{},
-		cholK:    &mat64.Cholesky{},
+	gp := &GP{
+		kernel:     kernel,
+		noise:      noise,
+		inputDim:   inputDim,
+		mean:       0,
+		std:        1,
+		inputs:     &mat64.Dense{},
+		outputs:    make([]float64, 0),
+		k:          mat64.NewSymDense(0, nil),
+		sigInvY:    &mat64.Vector{},
+		cholK:      &mat64.Cholesky{},
+		fixScaling: fixScaling,
 	}
+	if fixScaling {
+		gp.mean = mean
+		gp.std = std
+	}
+	return gp
+}
+
+func (g *GP) Add(x []float64, y float64) error {
+	return g.AddBatch(mat64.NewDense(1, len(x), x), []float64{y})
 }
 
 // AddBatch adds a set training points to the Gp. This call updates internal
@@ -120,8 +132,16 @@ func (g *GP) AddBatch(x mat64.Matrix, y []float64) error {
 		g.outputs[i] = v*g.std + g.mean
 	}
 	g.outputs = append(g.outputs, y...)
-	g.mean = stat.Mean(g.outputs, nil)
-	g.std = stat.StdDev(g.outputs, nil)
+	if !g.fixScaling {
+		g.mean = stat.Mean(g.outputs, nil)
+		g.std = stat.StdDev(g.outputs, nil)
+		if len(g.outputs) < 2 {
+			g.std = 1
+		}
+		if g.std == 0 {
+			g.std = 1
+		}
+	}
 	for i, v := range g.outputs {
 		g.outputs[i] = (v - g.mean) / g.std
 	}
@@ -174,6 +194,10 @@ func (g *GP) Mean(x []float64) float64 {
 		panic(badInputLength)
 	}
 	nSamples, _ := g.inputs.Dims()
+	if nSamples == 0 {
+		// TODO(btracey): Replace when can set a base mean function.
+		return g.mean
+	}
 
 	covariance := make([]float64, nSamples)
 	for i := range covariance {
@@ -198,6 +222,12 @@ func (g *GP) MeanBatch(yPred []float64, x mat64.Matrix) []float64 {
 		panic(badOutputLength)
 	}
 	nSamples, _ := g.inputs.Dims()
+	if nSamples == 0 {
+		for i := range yPred {
+			yPred[i] = g.mean
+		}
+		return yPred
+	}
 
 	covariance := mat64.NewDense(nSamples, rx, nil)
 	row := make([]float64, g.inputDim)
@@ -226,6 +256,11 @@ func (g *GP) StdDev(x []float64) float64 {
 	}
 	// nu_* = k(x_*, k_*) - k_*^T * K^-1 * k_*
 	n := len(g.outputs)
+
+	if n == 0 {
+		return g.kernel.Distance(x, x)
+	}
+
 	kstar := mat64.NewVector(n, nil)
 	for i := 0; i < n; i++ {
 		v := g.kernel.Distance(g.inputs.RawRowView(i), x)
@@ -255,6 +290,17 @@ func (g *GP) StdDevBatch(std []float64, x mat64.Matrix) []float64 {
 	if len(std) != r {
 		panic(badStorage)
 	}
+
+	n := len(g.outputs)
+	if n == 0 {
+		row := make([]float64, c)
+		for i := range std {
+			mat64.Row(row, i, x)
+			std[i] = g.kernel.Distance(row, row)
+		}
+		return std
+	}
+
 	// For a single point, the stddev is
 	// 		sigma = k(x,x) - k_*^T * K^-1 * k_*
 	// where k is the vector of kernels between the input points and the output points
@@ -289,10 +335,10 @@ func (g *GP) StdDevBatch(std []float64, x mat64.Matrix) []float64 {
 }
 
 // Cov returns the covariance between a set of data points based on the current
-// GP fit.
+// GP fit. If m is nil a new matrix is allocated.
 func (g *GP) Cov(m *mat64.SymDense, x mat64.Matrix) *mat64.SymDense {
 	if m != nil {
-		// TODO(btracey): Make this k**
+		// TODO(btracey): Make this k** instead of allocating below.
 		panic("resuing m not coded")
 	}
 	// The joint covariance matrix is
@@ -302,14 +348,7 @@ func (g *GP) Cov(m *mat64.SymDense, x mat64.Matrix) *mat64.SymDense {
 		panic(badInputLength)
 	}
 
-	// Compute K(x_*, x) K(x, x)^-1 K(x, x_*)
-	kstar := g.formKStar(x)
-	var tmp mat64.Dense
-	tmp.SolveCholesky(g.cholK, kstar)
-	var tmp2 mat64.Dense
-	tmp2.Mul(kstar.T(), &tmp)
-
-	// Compute k(x_*, x_*) and perform the subtraction.
+	// Compute k(x_*, x_*).
 	kstarstar := mat64.NewSymDense(nSamp, nil)
 	for i := 0; i < nSamp; i++ {
 		for j := i; j < nSamp; j++ {
@@ -317,9 +356,29 @@ func (g *GP) Cov(m *mat64.SymDense, x mat64.Matrix) *mat64.SymDense {
 			if i == j {
 				v += g.noise
 			}
-			kstarstar.SetSym(i, j, v-tmp2.At(i, j))
+			kstarstar.SetSym(i, j, v)
 		}
 	}
+
+	if len(g.outputs) == 0 {
+		return kstarstar
+	}
+
+	// Compute K(x_*, x) K(x, x)^-1 K(x, x_*)
+	kstar := g.formKStar(x)
+
+	var tmp mat64.Dense
+	tmp.SolveCholesky(g.cholK, kstar)
+	var tmp2 mat64.Dense
+	tmp2.Mul(kstar.T(), &tmp)
+
+	// Subtract tmp2 from k(x_*, x_*)
+	for i := 0; i < nSamp; i++ {
+		for j := i; j < nSamp; j++ {
+			kstarstar.SetSym(i, j, kstarstar.At(i, j)-tmp2.At(i, j))
+		}
+	}
+
 	return kstarstar
 }
 
@@ -331,9 +390,7 @@ func (g *GP) formKStar(x mat64.Matrix) *mat64.Dense {
 	kStar := mat64.NewDense(n, r, nil)
 	data := make([]float64, c)
 	for j := 0; j < r; j++ {
-		for k := 0; k < c; k++ {
-			data[k] = x.At(j, k)
-		}
+		mat64.Row(data, j, x)
 		for i := 0; i < n; i++ {
 			row := g.inputs.RawRowView(i)
 			v := g.kernel.Distance(row, data)
@@ -350,7 +407,9 @@ func (g *GP) Train(trainNoise bool) error {
 	// TODO(btracey): Implement a memory struct that can be passed around with
 	// all of this data.
 
-	initHyper := g.kernel.Hyper(nil)
+	ker := g.kernel.(OptimizableKernel)
+
+	initHyper := ker.Hyper(nil)
 	nKerHyper := len(initHyper)
 	if trainNoise {
 		initHyper = append(initHyper, math.Log(g.noise))
@@ -395,7 +454,7 @@ func (g *GP) Train(trainNoise bool) error {
 	result, err := optimize.Local(problem, initHyper, settings, nil)
 	// set noise
 	g.noise = math.Exp(result.X[len(result.X)-1])
-	g.kernel.SetHyper(result.X[:nKerHyper])
+	ker.SetHyper(result.X[:nKerHyper])
 	g.setKernelMat(g.k, g.noise)
 	ok := g.cholK.Factorize(g.k)
 	if !ok {
@@ -439,11 +498,12 @@ func newMargLikeMemory(hyper, outputs int) *margLikeMemory {
 func (g *GP) marginalLikelihood(x []float64, trainNoise bool, mem *margLikeMemory) float64 {
 
 	// TODO(btracey): Find a less hack-y way to introduce bounds.
-	nHyper := g.kernel.NumHyper()
+	ker := g.kernel.(OptimizableKernel)
+	nHyper := ker.NumHyper()
 
 	// If the parameters are outside the bounds introduce a quadratic penalty method
 	var barrier float64
-	bounds := g.kernel.Bounds()
+	bounds := ker.Bounds()
 	if trainNoise {
 		bounds = append(bounds, Bound{minLogNoise, maxLogNoise})
 	}
@@ -478,7 +538,7 @@ func (g *GP) marginalLikelihood(x []float64, trainNoise bool, mem *margLikeMemor
 	} else {
 		noise = g.noise
 	}
-	g.kernel.SetHyper(x[:nHyper])
+	ker.SetHyper(x[:nHyper])
 	g.setKernelMat(k, noise)
 	ok := chol.Factorize(k)
 	if !ok {
@@ -513,8 +573,9 @@ func (g *GP) marginalLikelihoodDerivative(x, grad []float64, trainNoise bool, me
 	// Multiply by the same -2
 	//		-α^T * K^-1 * α + tr(K^-1 dK/dTheta_j)
 	// This first computation is an inner product.
+	ker := g.kernel.(OptimizableKernel)
 	n := len(g.outputs)
-	nHyper := g.kernel.NumHyper()
+	nHyper := ker.NumHyper()
 	k := mem.k
 	chol := mem.chol
 	alpha := mem.alpha
@@ -533,7 +594,7 @@ func (g *GP) marginalLikelihoodDerivative(x, grad []float64, trainNoise bool, me
 	// If x is the same, then reuse what has been computed in the function.
 	if !floats.Equal(mem.lastX, x) {
 		copy(mem.lastX, x)
-		g.kernel.SetHyper(x[:nHyper])
+		ker.SetHyper(x[:nHyper])
 		g.setKernelMat(k, noise)
 		//chol.Cholesky(k, false)
 		chol.Factorize(k)
@@ -547,7 +608,7 @@ func (g *GP) marginalLikelihoodDerivative(x, grad []float64, trainNoise bool, me
 	}
 	floats.Scale(1/float64(n), grad)
 
-	bounds := g.kernel.Bounds()
+	bounds := ker.Bounds()
 	if trainNoise {
 		bounds = append(bounds, Bound{minLogNoise, maxLogNoise})
 	}
@@ -586,14 +647,15 @@ func (gp *GP) setKernelMat(s *mat64.SymDense, noise float64) {
 }
 
 func (gp *GP) setKernelMatDeriv(dKdTheta []*mat64.SymDense, trainNoise bool, noise float64) {
+	ker := gp.kernel.(OptimizableKernel)
 	n := len(gp.outputs)
-	nHyper := gp.kernel.NumHyper()
+	nHyper := ker.NumHyper()
 	dk := make([]float64, nHyper)
 	for i := 0; i < n; i++ {
 		for j := i; j < n; j++ {
 			one := gp.inputs.RawRowView(i)
 			two := gp.inputs.RawRowView(j)
-			gp.kernel.DistanceDHyper(one, two, dk)
+			ker.DistanceDHyper(one, two, dk)
 			for k := 0; k < nHyper; k++ {
 				dKdTheta[k].SetSym(i, j, dk[k])
 			}

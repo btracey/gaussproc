@@ -11,9 +11,14 @@ type Bound struct {
 	Max float64
 }
 
+// TODO(btracey): This should have kernel and optimizable kernel
 type Kernel interface {
 	//LogDistance(x, y []float64) float64
 	Distance(x, y []float64) float64
+}
+
+type OptimizableKernel interface {
+	Kernel
 	DistanceDHyper(x, y, deriv []float64) float64
 	// StationaryDistance(dist float64) (function of just the distance)
 	Hyper([]float64) []float64
@@ -175,4 +180,71 @@ func (k *UniSqExpIso) SetHyper(h []float64) {
 		panic("gp: hyperparameter length mismatch")
 	}
 	k.LogLength = h[0]
+}
+
+type Periodic struct {
+	// TODO(btracey): have sigma thing out front
+	LogLength float64
+
+	Domain float64 // length of the domain
+}
+
+func (p Periodic) LogDistance(x, y []float64) float64 {
+	if len(x) != 1 {
+		panic("only coded for dim 1")
+	}
+	if len(x) != len(y) {
+		panic("gp: size mismatch")
+	}
+	dist := math.Abs(x[0] - y[0])
+	s := math.Sin(math.Pi * dist / p.Domain)
+	el := math.Exp(p.LogLength)
+	return -2 * s * s / (el * el)
+}
+
+func (p Periodic) Distance(x, y []float64) float64 {
+	return math.Exp(p.LogDistance(x, y))
+}
+
+// Exponential implements the exponential kernel
+type Exponential struct {
+	LogLength float64
+}
+
+func (e Exponential) LogDistance(x, y []float64) float64 {
+	norm := floats.Distance(x, y, 2)
+	logNorm := math.Log(norm)
+	return -math.Exp(logNorm - e.LogLength)
+}
+
+func (e Exponential) Distance(x, y []float64) float64 {
+	return math.Exp(e.LogDistance(x, y))
+}
+
+func (e Exponential) Bounds() []Bound {
+	panic("not coded")
+}
+
+type MaternFiveHalf struct {
+	LogLength float64
+}
+
+func (m MaternFiveHalf) Distance(x, y []float64) float64 {
+	return math.Exp(m.LogDistance(x, y))
+}
+
+func (m MaternFiveHalf) LogDistance(x, y []float64) float64 {
+	// http://papers.nips.cc/paper/4522-practical-bayesian-optimization-of-machine-learning-algorithms.pdf
+	//
+	// K = (1 + sqrt(5 * r^2) + 5/3 * r^2) * exp(- sqrt(5*r^2))
+	// Where r^2 = ||x-x'||_2^2 / sigma^2
+	norm := floats.Distance(x, y, 2)
+	logR := math.Log(norm) - 2*m.LogLength
+	r := math.Exp(logR)
+
+	sq5rsq := math.Exp(0.5 * (math.Log(5) + 2*logR))
+
+	first := 1 + sq5rsq + 5.0/3*r*r
+	logK := math.Log(first) - sq5rsq
+	return logK
 }
