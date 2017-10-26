@@ -6,13 +6,13 @@ import (
 	"fmt"
 	"math"
 
-	"github.com/gonum/floats"
-	"github.com/gonum/matrix/mat64"
-	"github.com/gonum/optimize"
-	"github.com/gonum/stat"
+	"gonum.org/v1/gonum/floats"
+	"gonum.org/v1/gonum/mat"
+	"gonum.org/v1/gonum/optimize"
+	"gonum.org/v1/gonum/stat"
 )
 
-// TODO: Check if mat64 does the right thing when zero
+// TODO: Check if mat does the right thing when zero
 
 var (
 	minLogNoise = math.Log(1e-6)
@@ -52,16 +52,16 @@ type GP struct {
 
 	inputDim int
 
-	inputs  *mat64.Dense // matrix of the actual input data
-	outputs []float64    // output data stored scaled
+	inputs  *mat.Dense // matrix of the actual input data
+	outputs []float64  // output data stored scaled
 
 	mean float64 // The mean of the output data
 	std  float64 // standard deviation of the output data
 
-	k *mat64.SymDense // kernel matrix between inputs
-	//cholK   *mat64.TriDense
-	cholK   *mat64.Cholesky
-	sigInvY *mat64.Vector
+	k *mat.SymDense // kernel matrix between inputs
+	//cholK   *mat.TriDense
+	cholK   *mat.Cholesky
+	sigInvY *mat.VecDense
 
 	fixScaling bool
 }
@@ -85,11 +85,11 @@ func New(inputDim int, kernel Kernel, noise float64, fixScaling bool, mean, std 
 		inputDim:   inputDim,
 		mean:       0,
 		std:        1,
-		inputs:     &mat64.Dense{},
+		inputs:     &mat.Dense{},
 		outputs:    make([]float64, 0),
-		k:          mat64.NewSymDense(0, nil),
-		sigInvY:    &mat64.Vector{},
-		cholK:      &mat64.Cholesky{},
+		k:          mat.NewSymDense(0, nil),
+		sigInvY:    &mat.VecDense{},
+		cholK:      &mat.Cholesky{},
 		fixScaling: fixScaling,
 	}
 	if fixScaling {
@@ -100,13 +100,13 @@ func New(inputDim int, kernel Kernel, noise float64, fixScaling bool, mean, std 
 }
 
 func (g *GP) Add(x []float64, y float64) error {
-	return g.AddBatch(mat64.NewDense(1, len(x), x), []float64{y})
+	return g.AddBatch(mat.NewDense(1, len(x), x), []float64{y})
 }
 
 // AddBatch adds a set training points to the Gp. This call updates internal
 // values needed for prediction, so it is more efficient to add samples
 // as a batch.
-func (g *GP) AddBatch(x mat64.Matrix, y []float64) error {
+func (g *GP) AddBatch(x mat.Matrix, y []float64) error {
 	// Note: The outputs are stored scaled to have a mean of zero and a variance
 	// of 1.
 
@@ -122,9 +122,11 @@ func (g *GP) AddBatch(x mat64.Matrix, y []float64) error {
 	nSamples := len(g.outputs)
 
 	// Append the new data to the list of stored data.
-	inputs := mat64.NewDense(rx+nSamples, g.inputDim, nil)
+	inputs := mat.NewDense(rx+nSamples, g.inputDim, nil)
 	inputs.Copy(g.inputs)
-	inputs.View(nSamples, 0, rx, g.inputDim).(*mat64.Dense).Copy(x)
+	//inputs.View(nSamples, 0, rx, g.inputDim).(*mat.Dense).Copy(x)
+	inputs.Slice(nSamples, rx, 0, g.inputDim).(*mat.Dense).Copy(x)
+
 	g.inputs = inputs
 	// Rescale the output data to its original value, append the new data, and
 	// then rescale to have mean 0 and variance of 1.
@@ -147,7 +149,7 @@ func (g *GP) AddBatch(x mat64.Matrix, y []float64) error {
 	}
 
 	// Add to the kernel matrix.
-	k := mat64.NewSymDense(rx+nSamples, nil)
+	k := mat.NewSymDense(rx+nSamples, nil)
 	k.CopySym(g.k)
 	g.k = k
 	// Compute the kernel with the new points and the old points
@@ -169,15 +171,16 @@ func (g *GP) AddBatch(x mat64.Matrix, y []float64) error {
 		}
 	}
 	// Cache necessary matrix results for computing predictions.
-	var chol mat64.Cholesky
+	var chol mat.Cholesky
 	ok := chol.Factorize(g.k)
 	if !ok {
 		return ErrSingular
 	}
 	g.cholK = &chol
 	g.sigInvY.Reset()
-	v := mat64.NewVector(len(g.outputs), g.outputs)
-	g.sigInvY.SolveCholeskyVec(g.cholK, v)
+	v := mat.NewVecDense(len(g.outputs), g.outputs)
+	g.cholK.SolveVec(g.sigInvY, v)
+	//g.sigInvY.SolveCholeskyVec(g.cholK, v)
 	return nil
 }
 
@@ -209,7 +212,7 @@ func (g *GP) Mean(x []float64) float64 {
 
 // MeanBatch predicts the mean at the set of locations specified by x. Stores in-place into yPred
 // If yPred is nil new memory is allocated.
-func (g *GP) MeanBatch(yPred []float64, x mat64.Matrix) []float64 {
+func (g *GP) MeanBatch(yPred []float64, x mat.Matrix) []float64 {
 	rx, cx := x.Dims()
 	if cx != g.inputDim {
 		panic(badInputLength)
@@ -229,7 +232,7 @@ func (g *GP) MeanBatch(yPred []float64, x mat64.Matrix) []float64 {
 		return yPred
 	}
 
-	covariance := mat64.NewDense(nSamples, rx, nil)
+	covariance := mat.NewDense(nSamples, rx, nil)
 	row := make([]float64, g.inputDim)
 	for j := 0; j < rx; j++ {
 		for k := 0; k < g.inputDim; k++ {
@@ -240,7 +243,7 @@ func (g *GP) MeanBatch(yPred []float64, x mat64.Matrix) []float64 {
 			covariance.Set(i, j, v)
 		}
 	}
-	yPredVec := mat64.NewVector(len(yPred), yPred)
+	yPredVec := mat.NewVecDense(len(yPred), yPred)
 	yPredVec.MulVec(covariance.T(), g.sigInvY)
 	// Rescale the outputs
 	for i, v := range yPred {
@@ -261,15 +264,16 @@ func (g *GP) StdDev(x []float64) float64 {
 		return g.kernel.Distance(x, x)
 	}
 
-	kstar := mat64.NewVector(n, nil)
+	kstar := mat.NewVecDense(n, nil)
 	for i := 0; i < n; i++ {
 		v := g.kernel.Distance(g.inputs.RawRowView(i), x)
 		kstar.SetVec(i, v)
 	}
 	self := g.kernel.Distance(x, x)
-	var tmp mat64.Vector
-	tmp.SolveCholeskyVec(g.cholK, kstar)
-	var tmp2 mat64.Vector
+	var tmp mat.VecDense
+	g.cholK.SolveVec(&tmp, kstar)
+	//tmp.SolveCholeskyVec(g.cholK, kstar)
+	var tmp2 mat.VecDense
 	tmp2.MulVec(kstar.T(), &tmp)
 	rt, ct := tmp2.Dims()
 	if rt != 1 || ct != 1 {
@@ -279,7 +283,7 @@ func (g *GP) StdDev(x []float64) float64 {
 }
 
 // StdDevBatch predicts the standard deviation at a set of locations of x.
-func (g *GP) StdDevBatch(std []float64, x mat64.Matrix) []float64 {
+func (g *GP) StdDevBatch(std []float64, x mat.Matrix) []float64 {
 	r, c := x.Dims()
 	if c != g.inputDim {
 		panic(badInputLength)
@@ -295,7 +299,7 @@ func (g *GP) StdDevBatch(std []float64, x mat64.Matrix) []float64 {
 	if n == 0 {
 		row := make([]float64, c)
 		for i := range std {
-			mat64.Row(row, i, x)
+			mat.Row(row, i, x)
 			std[i] = g.kernel.Distance(row, row)
 		}
 		return std
@@ -310,18 +314,20 @@ func (g *GP) StdDevBatch(std []float64, x mat64.Matrix) []float64 {
 	// the standard deviations are just the diagonal of this matrix. Instead, be
 	// smart about it and compute the diagonal terms one at a time.
 	kStar := g.formKStar(x)
-	var tmp mat64.Dense
-	tmp.SolveCholesky(g.cholK, kStar)
+	var tmp mat.Dense
+	//tmp.SolveCholesky(g.cholK, kStar)
+	g.cholK.Solve(&tmp, kStar)
 
 	// set k(x_*, x_*) into std then subtract k_*^T K^-1 k_* , computed one row at a time
-	var tmp2 mat64.Vector
+	var tmp2 mat.VecDense
 	row := make([]float64, c)
 	for i := range std {
 		for k := 0; k < c; k++ {
 			row[k] = x.At(i, k)
 		}
 		std[i] = g.kernel.Distance(row, row)
-		tmp2.MulVec(kStar.ColView(i).T(), tmp.ColView(i))
+		view := kStar.ColView(i).(*mat.VecDense)
+		tmp2.MulVec(view.T(), tmp.ColView(i).(*mat.VecDense))
 		rt, ct := tmp2.Dims()
 		if rt != 1 && ct != 1 {
 			panic("bad size")
@@ -336,7 +342,7 @@ func (g *GP) StdDevBatch(std []float64, x mat64.Matrix) []float64 {
 
 // Cov returns the covariance between a set of data points based on the current
 // GP fit. If m is nil a new matrix is allocated.
-func (g *GP) Cov(m *mat64.SymDense, x mat64.Matrix) *mat64.SymDense {
+func (g *GP) Cov(m *mat.SymDense, x mat.Matrix) *mat.SymDense {
 	if m != nil {
 		// TODO(btracey): Make this k** instead of allocating below.
 		panic("resuing m not coded")
@@ -349,10 +355,10 @@ func (g *GP) Cov(m *mat64.SymDense, x mat64.Matrix) *mat64.SymDense {
 	}
 
 	// Compute k(x_*, x_*).
-	kstarstar := mat64.NewSymDense(nSamp, nil)
+	kstarstar := mat.NewSymDense(nSamp, nil)
 	for i := 0; i < nSamp; i++ {
 		for j := i; j < nSamp; j++ {
-			v := g.kernel.Distance(mat64.Row(nil, i, x), mat64.Row(nil, j, x))
+			v := g.kernel.Distance(mat.Row(nil, i, x), mat.Row(nil, j, x))
 			if i == j {
 				v += g.noise
 			}
@@ -367,9 +373,10 @@ func (g *GP) Cov(m *mat64.SymDense, x mat64.Matrix) *mat64.SymDense {
 	// Compute K(x_*, x) K(x, x)^-1 K(x, x_*)
 	kstar := g.formKStar(x)
 
-	var tmp mat64.Dense
-	tmp.SolveCholesky(g.cholK, kstar)
-	var tmp2 mat64.Dense
+	var tmp mat.Dense
+	//tmp.SolveCholesky(g.cholK, kstar)
+	g.cholK.Solve(&tmp, kstar)
+	var tmp2 mat.Dense
 	tmp2.Mul(kstar.T(), &tmp)
 
 	// Subtract tmp2 from k(x_*, x_*)
@@ -383,14 +390,14 @@ func (g *GP) Cov(m *mat64.SymDense, x mat64.Matrix) *mat64.SymDense {
 }
 
 // formKStar forms the covariance matrix between the inputs and new points.
-func (g *GP) formKStar(x mat64.Matrix) *mat64.Dense {
+func (g *GP) formKStar(x mat.Matrix) *mat.Dense {
 	// TODO(btracey): Parallelize
 	r, c := x.Dims()
 	n := len(g.outputs)
-	kStar := mat64.NewDense(n, r, nil)
+	kStar := mat.NewDense(n, r, nil)
 	data := make([]float64, c)
 	for j := 0; j < r; j++ {
-		mat64.Row(data, j, x)
+		mat.Row(data, j, x)
 		for i := 0; i < n; i++ {
 			row := g.inputs.RawRowView(i)
 			v := g.kernel.Distance(row, data)
@@ -460,35 +467,36 @@ func (g *GP) Train(trainNoise bool) error {
 	if !ok {
 		return errors.New("gp: final kernel matrix is not positive definite")
 	}
-	v := mat64.NewVector(len(g.outputs), g.outputs)
-	g.sigInvY.SolveCholeskyVec(g.cholK, v)
+	v := mat.NewVecDense(len(g.outputs), g.outputs)
+	g.cholK.SolveVec(g.sigInvY, v)
+	//g.sigInvY.SolveCholeskyVec(g.cholK, v)
 	return err
 }
 
 type margLikeMemory struct {
 	lastX []float64
 	// likelihood only
-	k     *mat64.SymDense
-	chol  *mat64.Cholesky
-	alpha *mat64.Vector
-	tmp   *mat64.Vector
+	k     *mat.SymDense
+	chol  *mat.Cholesky
+	alpha *mat.VecDense
+	tmp   *mat.VecDense
 	// For derivative
-	dKdTheta []*mat64.SymDense
-	kInvDK   *mat64.Dense
+	dKdTheta []*mat.SymDense
+	kInvDK   *mat.Dense
 }
 
 func newMargLikeMemory(hyper, outputs int) *margLikeMemory {
 	m := &margLikeMemory{
 		lastX:    make([]float64, hyper),
-		k:        mat64.NewSymDense(outputs, nil),
-		chol:     &mat64.Cholesky{},
-		alpha:    mat64.NewVector(outputs, nil),
-		tmp:      mat64.NewVector(1, nil),
-		dKdTheta: make([]*mat64.SymDense, hyper),
-		kInvDK:   mat64.NewDense(outputs, outputs, nil),
+		k:        mat.NewSymDense(outputs, nil),
+		chol:     &mat.Cholesky{},
+		alpha:    mat.NewVecDense(outputs, nil),
+		tmp:      mat.NewVecDense(1, nil),
+		dKdTheta: make([]*mat.SymDense, hyper),
+		kInvDK:   mat.NewDense(outputs, outputs, nil),
 	}
 	for i := 0; i < hyper; i++ {
-		m.dKdTheta[i] = mat64.NewSymDense(outputs, nil)
+		m.dKdTheta[i] = mat.NewSymDense(outputs, nil)
 	}
 	return m
 }
@@ -531,7 +539,7 @@ func (g *GP) marginalLikelihood(x []float64, trainNoise bool, mem *margLikeMemor
 	alpha := mem.alpha
 	tmp := mem.tmp
 
-	y := mat64.NewVector(n, g.outputs)
+	y := mat.NewVecDense(n, g.outputs)
 	var noise float64
 	if trainNoise {
 		noise = math.Exp(x[len(x)-1])
@@ -545,8 +553,9 @@ func (g *GP) marginalLikelihood(x []float64, trainNoise bool, mem *margLikeMemor
 		// The kernel matrix is singular. Don't let it be
 		return math.Inf(1)
 	}
-	alpha.SolveCholeskyVec(chol, y)
-	// TODO(btracey): add mat64.Dot(*Vector, *Vector)
+	chol.SolveVec(alpha, y)
+	//alpha.SolveCholeskyVec(chol, y)
+	// TODO(btracey): add mat.Dot(*Vector, *Vector)
 	tmp.MulVec(y.T(), alpha)
 	r, c := tmp.Dims()
 	if r != 1 || c != 1 {
@@ -582,7 +591,7 @@ func (g *GP) marginalLikelihoodDerivative(x, grad []float64, trainNoise bool, me
 	dKdTheta := mem.dKdTheta
 	kInvDK := mem.kInvDK
 
-	y := mat64.NewVector(n, g.outputs)
+	y := mat.NewVecDense(n, g.outputs)
 
 	var noise float64
 	if trainNoise {
@@ -598,13 +607,15 @@ func (g *GP) marginalLikelihoodDerivative(x, grad []float64, trainNoise bool, me
 		g.setKernelMat(k, noise)
 		//chol.Cholesky(k, false)
 		chol.Factorize(k)
-		alpha.SolveCholeskyVec(chol, y)
+		chol.SolveVec(alpha, y)
+		//alpha.SolveCholeskyVec(chol, y)
 	}
 	g.setKernelMatDeriv(dKdTheta, trainNoise, noise)
 	for i := range dKdTheta {
-		kInvDK.SolveCholesky(chol, dKdTheta[i])
-		inner := mat64.Inner(alpha, dKdTheta[i], alpha)
-		grad[i] = -inner + mat64.Trace(kInvDK)
+		chol.Solve(kInvDK, dKdTheta[i])
+		//kInvDK.SolveCholesky(chol, dKdTheta[i])
+		inner := mat.Inner(alpha, dKdTheta[i], alpha)
+		grad[i] = -inner + mat.Trace(kInvDK)
 	}
 	floats.Scale(1/float64(n), grad)
 
@@ -630,7 +641,7 @@ func (g *GP) marginalLikelihoodDerivative(x, grad []float64, trainNoise bool, me
 	//copy(grad, barrierGrad)
 }
 
-func (gp *GP) setKernelMat(s *mat64.SymDense, noise float64) {
+func (gp *GP) setKernelMat(s *mat.SymDense, noise float64) {
 	n := s.Symmetric()
 	for i := 0; i < n; i++ {
 		for j := i; j < n; j++ {
@@ -646,7 +657,7 @@ func (gp *GP) setKernelMat(s *mat64.SymDense, noise float64) {
 	}
 }
 
-func (gp *GP) setKernelMatDeriv(dKdTheta []*mat64.SymDense, trainNoise bool, noise float64) {
+func (gp *GP) setKernelMatDeriv(dKdTheta []*mat.SymDense, trainNoise bool, noise float64) {
 	ker := gp.kernel.(OptimizableKernel)
 	n := len(gp.outputs)
 	nHyper := ker.NumHyper()
@@ -679,7 +690,7 @@ func (gp *GP) setKernelMatDeriv(dKdTheta []*mat64.SymDense, trainNoise bool, noi
 /*
 // PredictCov predicts the covariance of the outputs at a single point x.
 // y is outputDim x outputDim. If y == nil, a new matrix is allocated.
-func (gp *GP) PredictCov(y *mat64.SymDense, x []float64) *mat64.SymDense {
+func (gp *GP) PredictCov(y *mat.SymDense, x []float64) *mat.SymDense {
 
 }
 */

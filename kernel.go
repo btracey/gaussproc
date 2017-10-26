@@ -3,7 +3,7 @@ package gaussproc
 import (
 	"math"
 
-	"github.com/gonum/floats"
+	"gonum.org/v1/gonum/floats"
 )
 
 type Bound struct {

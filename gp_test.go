@@ -5,10 +5,10 @@ import (
 	"math/rand"
 	"testing"
 
-	"github.com/gonum/diff/fd"
-	"github.com/gonum/floats"
-	"github.com/gonum/matrix/mat64"
-	"github.com/gonum/stat/distmv"
+	"gonum.org/v1/gonum/diff/fd"
+	"gonum.org/v1/gonum/floats"
+	"gonum.org/v1/gonum/mat"
+	"gonum.org/v1/gonum/stat/distmv"
 )
 
 type Rastrigin struct{}
@@ -49,7 +49,7 @@ func TestAddBatch(t *testing.T) {
 		xs = append(xs, x)
 		y := []float64{Rastrigin{}.F(x)}
 		// Add a point
-		err := g.AddBatch(mat64.NewDense(1, inputDim, x), y)
+		err := g.AddBatch(mat.NewDense(1, inputDim, x), y)
 		if err != nil {
 			t.Fatalf("Error adding data: ", err.Error())
 		}
@@ -90,7 +90,7 @@ func TestPredict(t *testing.T) {
 	nSamples := 1000
 	inputDim := 1
 	min, max := 0.0, 10.0
-	x := mat64.NewDense(nSamples, inputDim, nil)
+	x := mat.NewDense(nSamples, inputDim, nil)
 	for i := 0; i < nSamples; i++ {
 		for j := 0; j < inputDim; j++ {
 			x.Set(i, j, rand.Float64()*(max-min)+min)
@@ -125,7 +125,7 @@ func TestPredict(t *testing.T) {
 	}
 
 	// Test that predict batch and predict return roughly the same answer.
-	xMat := mat64.NewDense(nTest, 1, xs)
+	xMat := mat.NewDense(nTest, 1, xs)
 	yBatch := g.MeanBatch(nil, xMat)
 	if !floats.EqualApprox(yBatch, ys, 1e-8) {
 		t.Errorf("Predict batch mismatch. Want %v, got %v.", ys, yBatch)
@@ -171,7 +171,7 @@ func TestMLGrad(t *testing.T) {
 			n := test.n
 			inputDim := test.inputDim
 			// Create fake data.
-			xs := mat64.NewDense(n, inputDim, nil)
+			xs := mat.NewDense(n, inputDim, nil)
 			ys := make([]float64, n)
 			unif := distmv.NewUniform(test.bounds, nil)
 			for i := 0; i < n; i++ {
@@ -290,7 +290,7 @@ func TestTrain(t *testing.T) {
 		noise := test.noise
 		n := test.n
 		inputDim := test.inputDim
-		xs := mat64.NewDense(n, inputDim, nil)
+		xs := .NewDense(n, inputDim, nil)
 		ys := make([]float64, n)
 		unif := distmv.NewUniform(test.bounds, nil)
 		for i := 0; i < n; i++ {
@@ -312,10 +312,10 @@ func TestTrain(t *testing.T) {
 		}
 
 		// Test that the kernel function matches the kernel function derivatives.
-		k := mat64.NewSymDense(n, nil)
-		dk := make([]*mat64.SymDense, nHyper)
+		k := .NewSymDense(n, nil)
+		dk := make([]*.SymDense, nHyper)
 		for i := range dk {
-			dk[i] = mat64.NewSymDense(n, nil)
+			dk[i] = .NewSymDense(n, nil)
 		}
 		gp.setKernelMatDeriv(dk, trainNoise, noise)
 		for i := 0; i < n; i++ {
@@ -408,8 +408,8 @@ func TestMarginalLikelihood(t *testing.T) {
 		0.670874423968597,
 		0.377353755101082,
 	}
-	x := mat64.NewDense(len(xData), 1, xData)
-	y := mat64.NewDense(len(yData), 1, yData)
+	x := .NewDense(len(xData), 1, xData)
+	y := .NewDense(len(yData), 1, yData)
 
 	kernel := &SqExpIso{
 		LogLength:   0, // -0.993396872857613,
@@ -488,19 +488,19 @@ func TestLeaveOneOut(t *testing.T) {
 		0.670874423968597,
 		0.377353755101082,
 	}
-	x := mat64.NewDense(len(xData), 1, xData)
-	y := mat64.NewDense(len(yData), 1, yData)
+	x := .NewDense(len(xData), 1, xData)
+	y := .NewDense(len(yData), 1, yData)
 
 	nSamples := 1000
 	inputDim := 1
 	min, max := -1.0, 1.0
-	x := mat64.NewDense(nSamples, inputDim, nil)
+	x := .NewDense(nSamples, inputDim, nil)
 	for i := 0; i < nSamples; i++ {
 		for j := 0; j < inputDim; j++ {
 			x.Set(i, j, rand.Float64()*(max-min)+min)
 		}
 	}
-	y := mat64.NewDense(nSamples, 1, nil)
+	y := .NewDense(nSamples, 1, nil)
 	for i := 0; i < nSamples; i++ {
 		y.SetRow(i, []float64{Rastrigin{}.F(x.Row(nil, i))})
 	}
@@ -549,13 +549,13 @@ func TestMarginalLikelihood2(t *testing.T) {
 	nSamples := 50
 	inputDim := 1
 	min, max := -1.0, 1.0
-	x := mat64.NewDense(nSamples, inputDim, nil)
+	x := .NewDense(nSamples, inputDim, nil)
 	for i := 0; i < nSamples; i++ {
 		for j := 0; j < inputDim; j++ {
 			x.Set(i, j, rand.Float64()*(max-min)+min)
 		}
 	}
-	y := mat64.NewDense(nSamples, 1, nil)
+	y := .NewDense(nSamples, 1, nil)
 	for i := 0; i < nSamples; i++ {
 		y.SetRow(i, []float64{Rastrigin{}.F(x.Row(nil, i))})
 	}
