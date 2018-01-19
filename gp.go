@@ -1,4 +1,3 @@
-// gaussproc is a package for using gaussian processes.
 package gaussproc
 
 import (
@@ -6,718 +5,401 @@ import (
 	"fmt"
 	"math"
 
-	"gonum.org/v1/gonum/floats"
+	"gonum.org/v1/gonum/stat/distmv"
+
+	"github.com/btracey/kernel"
+
 	"gonum.org/v1/gonum/mat"
-	"gonum.org/v1/gonum/optimize"
 	"gonum.org/v1/gonum/stat"
-)
-
-// TODO: Check if mat does the right thing when zero
-
-var (
-	minLogNoise = math.Log(1e-6)
-	maxLogNoise = math.Log(1.0)
-)
-
-const (
-	initGpSize = 0
-
-	barrierPow = 4 // what power on breaking the barrier
-	//minGrowSize = 100
-	//maxGrowSize = 1000
-)
-
-const (
-	badInputLength  = "gp: input length mismatch"
-	badOutputLength = "gp: output length mismatch"
-	badInOut        = "gp: inequal number of input and output samples"
-	badStorage      = "gp: bad storage length"
+	"gonum.org/v1/gonum/stat/distuv"
 )
 
 var (
-	ErrSingular = errors.New("gp: kernel matrix singular or near singular")
+	badInputDim        = "gaussproc: input dimension mismatch"
+	badStorageDim      = "gaussproc: storage dimension mismatch"
+	nilInput           = "gaussproc: nil input not allowed"
+	dataLengthMismatch = "gaussproc: data length mismatch"
 )
 
-// TODO (btracey): Should the inputs be scaled automatically? Would help guess
-// the hyperparameters better. Could otherwise just use the data as an initial guess
-// and don't scale
+var (
+	NotPosDef = errors.New("gaussproc: error not positive definite")
+)
 
-// TODO(btracey): Need to add in noise parameter. Only multiplied along diagonal.
-// TODO(btracey): Think about adding weights
-
-// Gp contains a Gaussian Process fit.
 type GP struct {
-	kernel Kernel  // Kernel function of the Gaussian process
-	noise  float64 // noise added to the diagonal of the covariance matrix
+	ker   kernel.Kerneler
+	noise float64
 
-	inputDim int
+	x *mat.Dense
+	y []float64
 
-	inputs  *mat.Dense // matrix of the actual input data
-	outputs []float64  // output data stored scaled
+	kInv  *mat.Cholesky
+	kInvY *mat.VecDense
 
-	mean float64 // The mean of the output data
-	std  float64 // standard deviation of the output data
-
-	k *mat.SymDense // kernel matrix between inputs
-	//cholK   *mat.TriDense
-	cholK   *mat.Cholesky
-	sigInvY *mat.VecDense
-
-	fixScaling bool
+	meanX []float64
+	stdX  []float64
+	meanY float64
+	stdY  float64
 }
 
-// New creates a new GP with the given input dimension, the given
-// kernel function, and output noise parameter. Output dim must be one.
-func New(inputDim int, kernel Kernel, noise float64, fixScaling bool, mean, std float64) *GP {
-	if inputDim <= 0 {
-		panic("gp: non-positive inputDim")
+// NewGP constructs a new Gaussian process with the given input and output data.
+// If normalized is true, the data is scaled to have mean 0 variance 1 before
+// being passed to the kernel. If x and y are both nil, normalized has no effect
+func NewGP(ker kernel.Kerneler, x mat.Matrix, y []float64, noise float64, normalized bool) (*GP, error) {
+	if x == nil {
+		if y != nil {
+			panic(badInputDim)
+		}
+		return &GP{
+			ker:   ker,
+			noise: noise,
+			meanY: 0,
+			stdY:  1,
+		}, nil
 	}
-	if kernel == nil {
-		panic("gp: nil kernel")
+
+	samp, dim := x.Dims()
+	if len(y) != samp {
+		panic(badInputDim)
 	}
-	if !(noise >= 0) {
-		panic("gp: negative noise") // also handles NaN.
+
+	xCopy := mat.NewDense(samp, dim, nil)
+	xCopy.Copy(x)
+	yCopy := make([]float64, len(y))
+	copy(yCopy, y)
+
+	// Need to put scaling in here.
+	var meanX, stdX []float64
+	meanY, stdY := 0.0, 1.0
+	if normalized {
+		meanX, stdX = MeanStdMat(xCopy)
+		meanY, stdY = stat.MeanStdDev(yCopy, nil)
 	}
 
 	gp := &GP{
-		kernel:     kernel,
-		noise:      noise,
-		inputDim:   inputDim,
-		mean:       0,
-		std:        1,
-		inputs:     &mat.Dense{},
-		outputs:    make([]float64, 0),
-		k:          mat.NewSymDense(0, nil),
-		sigInvY:    &mat.VecDense{},
-		cholK:      &mat.Cholesky{},
-		fixScaling: fixScaling,
-	}
-	if fixScaling {
-		gp.mean = mean
-		gp.std = std
-	}
-	return gp
-}
+		ker:   ker,
+		noise: noise,
+		x:     xCopy,
+		y:     yCopy,
 
-func (g *GP) Add(x []float64, y float64) error {
-	return g.AddBatch(mat.NewDense(1, len(x), x), []float64{y})
-}
-
-// AddBatch adds a set training points to the Gp. This call updates internal
-// values needed for prediction, so it is more efficient to add samples
-// as a batch.
-func (g *GP) AddBatch(x mat.Matrix, y []float64) error {
-	// Note: The outputs are stored scaled to have a mean of zero and a variance
-	// of 1.
-
-	// Verify input parameters
-	rx, cx := x.Dims()
-	ry := len(y)
-	if rx != ry {
-		panic(badInOut)
-	}
-	if cx != g.inputDim {
-		panic(badInputLength)
-	}
-	nSamples := len(g.outputs)
-
-	// Append the new data to the list of stored data.
-	inputs := mat.NewDense(rx+nSamples, g.inputDim, nil)
-	inputs.Copy(g.inputs)
-	//inputs.View(nSamples, 0, rx, g.inputDim).(*mat.Dense).Copy(x)
-	inputs.Slice(nSamples, rx, 0, g.inputDim).(*mat.Dense).Copy(x)
-
-	g.inputs = inputs
-	// Rescale the output data to its original value, append the new data, and
-	// then rescale to have mean 0 and variance of 1.
-	for i, v := range g.outputs {
-		g.outputs[i] = v*g.std + g.mean
-	}
-	g.outputs = append(g.outputs, y...)
-	if !g.fixScaling {
-		g.mean = stat.Mean(g.outputs, nil)
-		g.std = stat.StdDev(g.outputs, nil)
-		if len(g.outputs) < 2 {
-			g.std = 1
-		}
-		if g.std == 0 {
-			g.std = 1
-		}
-	}
-	for i, v := range g.outputs {
-		g.outputs[i] = (v - g.mean) / g.std
+		meanX: meanX,
+		stdX:  stdX,
+		meanY: meanY,
+		stdY:  stdY,
 	}
 
-	// Add to the kernel matrix.
-	k := mat.NewSymDense(rx+nSamples, nil)
-	k.CopySym(g.k)
-	g.k = k
-	// Compute the kernel with the new points and the old points
-	for i := 0; i < nSamples; i++ {
-		for j := nSamples; j < rx+nSamples; j++ {
-			v := g.kernel.Distance(g.inputs.RawRowView(i), g.inputs.RawRowView(j))
-			g.k.SetSym(i, j, v)
-		}
-	}
+	k := kernelMatrixSym(nil, xCopy, meanX, stdX, ker, gp.noise)
 
-	// Compute the kernel with the new points and themselves
-	for i := nSamples; i < rx+nSamples; i++ {
-		for j := i; j < nSamples+rx; j++ {
-			v := g.kernel.Distance(g.inputs.RawRowView(i), g.inputs.RawRowView(j))
-			if i == j {
-				v += g.noise
-			}
-			g.k.SetSym(i, j, v)
-		}
-	}
-	// Cache necessary matrix results for computing predictions.
 	var chol mat.Cholesky
-	ok := chol.Factorize(g.k)
+	ok := chol.Factorize(k)
 	if !ok {
-		return ErrSingular
+		return nil, NotPosDef
 	}
-	g.cholK = &chol
-	g.sigInvY.Reset()
-	v := mat.NewVecDense(len(g.outputs), g.outputs)
-	g.cholK.SolveVec(g.sigInvY, v)
-	//g.sigInvY.SolveCholeskyVec(g.cholK, v)
+
+	yScaled := scaleY(nil, yCopy, meanY, stdY)
+	yScaledVec := mat.NewVecDense(len(yScaled), yScaled)
+	kInvY := mat.NewVecDense(len(yScaled), nil)
+
+	chol.SolveVec(kInvY, yScaledVec)
+
+	gp.kInv = &chol
+	gp.kInvY = kInvY
+	return gp, nil
+}
+
+// TODO(btracey): This should really be a Marginal.
+
+func (gp *GP) InputScaling() (mean, std []float64) {
+	meanX := make([]float64, len(gp.meanX))
+	copy(meanX, gp.meanX)
+	stdX := make([]float64, len(gp.stdX))
+	copy(stdX, gp.stdX)
+	return meanX, stdX
+}
+
+func (gp *GP) OutputScaling() (mean, std float64) {
+	return gp.meanY, gp.stdY
+}
+
+func (gp *GP) MeanStd(x []float64) (mean, std float64) {
+	xMat := mat.NewDense(1, len(x), x)
+	means, stds := gp.MeansStds(xMat)
+	return means[0], stds[0]
+}
+
+// MeanStd returns the mean and standard deviation for the input locations.
+func (gp *GP) MeansStds(x mat.Matrix) (mean, std []float64) {
+	samp, dim := x.Dims()
+	meanDst := make([]float64, samp)
+	stdDst := make([]float64, samp)
+	if gp.x == nil {
+		// There are no data points yet, so the prediction is just the base
+		// mean and variance.
+		for i := range meanDst {
+			meanDst[i] = gp.meanY
+			stdDst[i] = gp.stdY
+		}
+	}
+
+	// Compute the kernel between the new data and the existing data.
+	kxd := kernelMatrix(nil, x, gp.x, gp.meanX, gp.stdX, gp.ker)
+
+	// Mean prediction is
+	//  k_{x,d}*k_{d,d}^-1 y
+	meanVec := mat.NewVecDense(samp, meanDst)
+	meanVec.MulVec(kxd, gp.kInvY)
+
+	// For each point, the variance is
+	//  k_{x,x} - k_{x,d}*k_{d,d}^-1 * k_{x,d}'
+	// Compute these terms one at a time since otherwise there is a huge explosion
+	// in the memory requirements.
+	row := make([]float64, dim)
+	rowMat := mat.NewDense(1, len(row), row)
+
+	nData, _ := gp.x.Dims()
+	kxdData := make([]float64, nData)
+	kxdMat := mat.NewDense(1, nData, kxdData)
+	kxdVec := mat.NewVecDense(nData, kxdData)
+
+	kxx := mat.NewSymDense(1, nil)
+	tmp := mat.NewVecDense(nData, nil)
+	for i := 0; i < samp; i++ {
+		mat.Row(row, i, x)
+		kernelMatrix(kxdMat, rowMat, gp.x, gp.meanX, gp.stdX, gp.ker)
+		kernelMatrixSym(kxx, rowMat, gp.meanX, gp.stdX, gp.ker, 0) // This isn't supposed to have noise
+		gp.kInv.SolveVec(tmp, kxdVec)
+		stdDst[i] = kxx.At(0, 0) - mat.Dot(tmp, kxdVec)
+	}
+
+	// Above is the variance, NOT the standard deviation.
+	for i, v := range stdDst {
+		stdDst[i] = math.Sqrt(v)
+	}
+
+	// Need to unscale the mean and std.
+	mean = make([]float64, samp)
+	std = make([]float64, samp)
+	unscaleY(mean, meanDst, gp.meanY, gp.stdY)
+	unscaleY(std, stdDst, 0, gp.stdY) // mean doesn't shift, just the scale.
+	return mean, std
+}
+
+func (gp *GP) MeanCov(x mat.Matrix) (means []float64, cov *mat.SymDense) {
+	samp, _ := x.Dims()
+	meanDst := make([]float64, samp)
+	covDst := mat.NewSymDense(samp, nil)
+
+	// Compute the kernel between the new locations and themselves.
+	kdd := kernelMatrixSym(nil, x, gp.meanX, gp.meanX, gp.ker, gp.noise)
+
+	if gp.x == nil {
+		// There are no data points yet, so the prediction is just the base
+		// mean and variance.
+		for i := range meanDst {
+			meanDst[i] = gp.meanY
+		}
+		covDst.CopySym(kdd)
+		if gp.meanY != 0 || gp.stdY != 1 {
+			panic("not coded for scaled")
+		}
+		return meanDst, covDst
+	}
+
+	// Compute the kernel between the new data and the existing data.
+	kxd := kernelMatrix(nil, x, gp.x, gp.meanX, gp.stdX, gp.ker)
+
+	// Mean prediction is
+	//  k_{x,d}*k_{d,d}^-1 y
+	meanVec := mat.NewVecDense(samp, meanDst)
+	meanVec.MulVec(kxd, gp.kInvY)
+
+	// Cov matrix is:
+	//  k_{x,x} - k_{x,d}*k_{d,d}^-1 * k_{x,d}'
+	var tmp mat.Dense
+	gp.kInv.Solve(&tmp, kxd.T())
+	var tmp2 mat.Dense
+	tmp2.Mul(kxd, &tmp)
+	for i := 0; i < samp; i++ {
+		for j := 0; j < samp; j++ {
+			v := kdd.At(i, j) - tmp2.At(i, j)
+			covDst.SetSym(i, j, v)
+		}
+	}
+	if gp.meanY != 0 || gp.stdY != 1 {
+		panic("not coded for scaled")
+	}
+	return meanDst, covDst
+}
+
+// Observe updates the Gaussian process with the observation that f(x) = y. This
+// does not update the variable scaling or anything involving the Kernel.
+func (gp *GP) Observe(x []float64, y float64) error {
+	nData, dim := gp.x.Dims()
+	if len(x) != dim {
+		panic(badInputDim)
+	}
+	// Update the Cholesky decomposition of k_{d,d}
+	kData := make([]float64, nData+1) // ndata + 1 because we also need the kernel with itself
+	// First, compute the kernel between the new points and the old locations.
+	kxdMat := mat.NewDense(1, nData, kData[:nData])
+	xmat := mat.NewDense(1, dim, x)
+	kernelMatrix(kxdMat, xmat, gp.x, gp.meanX, gp.stdX, gp.ker)
+	// Add the kernel with itself at the end
+	kxxMat := mat.NewSymDense(1, kData[nData:nData+1])
+	kernelMatrixSym(kxxMat, xmat, gp.meanX, gp.stdX, gp.ker, gp.noise)
+
+	// Now, update the Cholesky decomposition with the new kernel data.
+	kVec := mat.NewVecDense(len(kData), kData)
+	ok := gp.kInv.ExtendVecSym(gp.kInv, kVec)
+	if !ok {
+		return errors.New("not pos def")
+	}
+	// Extend the existing data with the new data.
+	// TODO(btracey): Be smarter about growing the matrix, so dont' need to copy
+	// everything every time.
+	newx := mat.NewDense(nData+1, dim, nil)
+	newx.Copy(gp.x)
+	for j := 0; j < dim; j++ {
+		newx.Set(nData, j, x[j])
+	}
+	gp.x = newx
+	gp.y = append(gp.y, y)
+
+	yScaled := scaleY(nil, gp.y, gp.meanY, gp.stdY)
+	yScaledVec := mat.NewVecDense(len(yScaled), yScaled)
+	kInvY := mat.NewVecDense(len(yScaled), nil)
+	gp.kInv.SolveVec(kInvY, yScaledVec)
+	gp.kInvY = kInvY
 	return nil
 }
 
-// Mean returns the gaussian process prediction of the mean at the location x.
-func (g *GP) Mean(x []float64) float64 {
-	// y_mean = k_*^T K^-1 y
-	// where k_* is the vector of the kernel between the new location and all
-	// of the data points
-	// y are the outputs at all the data points
-	// K^-1 is the full covariance of the data points
-	// (K^-1y is stored)
-
-	if len(x) != g.inputDim {
-		panic(badInputLength)
-	}
-	nSamples, _ := g.inputs.Dims()
-	if nSamples == 0 {
-		// TODO(btracey): Replace when can set a base mean function.
-		return g.mean
-	}
-
-	covariance := make([]float64, nSamples)
-	for i := range covariance {
-		covariance[i] = g.kernel.Distance(x, g.inputs.RawRowView(i))
-	}
-	y := floats.Dot(g.sigInvY.RawVector().Data, covariance)
-	return y*g.std + g.mean
+func (gp *GP) ExpectedImprovement(x []float64, best float64) float64 {
+	mean, std := gp.MeanStd(x)
+	n := distuv.Normal{Mu: mean, Sigma: std}
+	return ExpectedImprovementGaussian(best, n)
 }
 
-// MeanBatch predicts the mean at the set of locations specified by x. Stores in-place into yPred
-// If yPred is nil new memory is allocated.
-func (g *GP) MeanBatch(yPred []float64, x mat.Matrix) []float64 {
-	rx, cx := x.Dims()
-	if cx != g.inputDim {
-		panic(badInputLength)
+// ExpectedImprovementGaussian returns the expected improvement over the
+// current best. This assumes the function is being minimized. Higher
+// expected improvement is better. If math.IsInf(best,1), then it assumes
+// no samples have been observed and so the expected improvement is just the
+// negative mean.
+func ExpectedImprovementGaussian(best float64, n distuv.Normal) float64 {
+	mean := n.Mean()
+	std := n.StdDev()
+	if math.IsInf(best, 1) {
+		return -mean
 	}
-	if yPred == nil {
-		yPred = make([]float64, rx)
-	}
-	ry := len(yPred)
-	if rx != ry {
-		panic(badOutputLength)
-	}
-	nSamples, _ := g.inputs.Dims()
-	if nSamples == 0 {
-		for i := range yPred {
-			yPred[i] = g.mean
-		}
-		return yPred
-	}
-
-	covariance := mat.NewDense(nSamples, rx, nil)
-	row := make([]float64, g.inputDim)
-	for j := 0; j < rx; j++ {
-		for k := 0; k < g.inputDim; k++ {
-			row[k] = x.At(j, k)
-		}
-		for i := 0; i < nSamples; i++ {
-			v := g.kernel.Distance(g.inputs.RawRowView(i), row)
-			covariance.Set(i, j, v)
-		}
-	}
-	yPredVec := mat.NewVecDense(len(yPred), yPred)
-	yPredVec.MulVec(covariance.T(), g.sigInvY)
-	// Rescale the outputs
-	for i, v := range yPred {
-		yPred[i] = v*g.std + g.mean
-	}
-	return yPred
+	d := distuv.UnitNormal
+	z := (best - mean) / std
+	ei := (best-mean)*d.CDF(z) + std*d.Prob(z)
+	return ei
 }
 
-// StdDev predicts the standard deviation of the function at x.
-func (g *GP) StdDev(x []float64) float64 {
-	if len(x) != g.inputDim {
-		panic(badInputLength)
-	}
-	// nu_* = k(x_*, k_*) - k_*^T * K^-1 * k_*
-	n := len(g.outputs)
-
-	if n == 0 {
-		return g.kernel.Distance(x, x)
-	}
-
-	kstar := mat.NewVecDense(n, nil)
-	for i := 0; i < n; i++ {
-		v := g.kernel.Distance(g.inputs.RawRowView(i), x)
-		kstar.SetVec(i, v)
-	}
-	self := g.kernel.Distance(x, x)
-	var tmp mat.VecDense
-	g.cholK.SolveVec(&tmp, kstar)
-	//tmp.SolveCholeskyVec(g.cholK, kstar)
-	var tmp2 mat.VecDense
-	tmp2.MulVec(kstar.T(), &tmp)
-	rt, ct := tmp2.Dims()
-	if rt != 1 || ct != 1 {
-		panic("bad size")
-	}
-	return math.Sqrt(self-tmp2.At(0, 0)) * g.std
+// MarginalLikelihoodGP is a type for computing the marginal likelihood as a function
+// of Kernel hyperparameters for a Gaussian Process.
+//
+// TODO(btracey): Have an OptNoise term.
+type LikelihoodGP struct {
+	Kernel kernel.LogKernelHyperer
+	Noise  float64
+	X      mat.Matrix
+	Y      []float64
+	MeanX  []float64
+	StdX   []float64
+	MeanY  float64
+	StdY   float64
 }
 
-// StdDevBatch predicts the standard deviation at a set of locations of x.
-func (g *GP) StdDevBatch(std []float64, x mat.Matrix) []float64 {
-	r, c := x.Dims()
-	if c != g.inputDim {
-		panic(badInputLength)
-	}
-	if std == nil {
-		std = make([]float64, r)
-	}
-	if len(std) != r {
-		panic(badStorage)
-	}
-
-	n := len(g.outputs)
-	if n == 0 {
-		row := make([]float64, c)
-		for i := range std {
-			mat.Row(row, i, x)
-			std[i] = g.kernel.Distance(row, row)
-		}
-		return std
-	}
-
-	// For a single point, the stddev is
-	// 		sigma = k(x,x) - k_*^T * K^-1 * k_*
-	// where k is the vector of kernels between the input points and the output points
-	// For many points, the formula is:
-	// 		nu_* = k(x_*, k_*) - k_*^T * K^-1 * k_*
-	// This creates the full covariance matrix which is an rxr matrix. However,
-	// the standard deviations are just the diagonal of this matrix. Instead, be
-	// smart about it and compute the diagonal terms one at a time.
-	kStar := g.formKStar(x)
-	var tmp mat.Dense
-	//tmp.SolveCholesky(g.cholK, kStar)
-	g.cholK.Solve(&tmp, kStar)
-
-	// set k(x_*, x_*) into std then subtract k_*^T K^-1 k_* , computed one row at a time
-	var tmp2 mat.VecDense
-	row := make([]float64, c)
-	for i := range std {
-		for k := 0; k < c; k++ {
-			row[k] = x.At(i, k)
-		}
-		std[i] = g.kernel.Distance(row, row)
-		view := kStar.ColView(i).(*mat.VecDense)
-		tmp2.MulVec(view.T(), tmp.ColView(i).(*mat.VecDense))
-		rt, ct := tmp2.Dims()
-		if rt != 1 && ct != 1 {
-			panic("bad size")
-		}
-		std[i] -= tmp2.At(0, 0)
-		std[i] = math.Sqrt(std[i])
-	}
-	// Need to scale the standard deviation to be in the same units as y.
-	floats.Scale(g.std, std)
-	return std
+// Normalize normalizes the X and Y data, overwriting the existing X and Y data.
+func (m LikelihoodGP) Normalize() {
+	meanX, stdX := MeanStdMat(m.X)
+	m.MeanX = meanX
+	m.StdX = stdX
+	meanY, stdY := stat.MeanStdDev(m.Y, nil)
+	m.MeanY = meanY
+	m.StdY = stdY
 }
 
-// Cov returns the covariance between a set of data points based on the current
-// GP fit. If m is nil a new matrix is allocated.
-func (g *GP) Cov(m *mat.SymDense, x mat.Matrix) *mat.SymDense {
-	if m != nil {
-		// TODO(btracey): Make this k** instead of allocating below.
-		panic("resuing m not coded")
-	}
-	// The joint covariance matrix is
-	// K(x_*, k_*) - k(x_*, x) k(x,x)^-1 k(x, x*)
-	nSamp, nDim := x.Dims()
-	if nDim != g.inputDim {
-		panic(badInputLength)
-	}
-
-	// Compute k(x_*, x_*).
-	kstarstar := mat.NewSymDense(nSamp, nil)
-	for i := 0; i < nSamp; i++ {
-		for j := i; j < nSamp; j++ {
-			v := g.kernel.Distance(mat.Row(nil, i, x), mat.Row(nil, j, x))
-			if i == j {
-				v += g.noise
-			}
-			kstarstar.SetSym(i, j, v)
-		}
-	}
-
-	if len(g.outputs) == 0 {
-		return kstarstar
-	}
-
-	// Compute K(x_*, x) K(x, x)^-1 K(x, x_*)
-	kstar := g.formKStar(x)
-
-	var tmp mat.Dense
-	//tmp.SolveCholesky(g.cholK, kstar)
-	g.cholK.Solve(&tmp, kstar)
-	var tmp2 mat.Dense
-	tmp2.Mul(kstar.T(), &tmp)
-
-	// Subtract tmp2 from k(x_*, x_*)
-	for i := 0; i < nSamp; i++ {
-		for j := i; j < nSamp; j++ {
-			kstarstar.SetSym(i, j, kstarstar.At(i, j)-tmp2.At(i, j))
-		}
-	}
-
-	return kstarstar
-}
-
-// formKStar forms the covariance matrix between the inputs and new points.
-func (g *GP) formKStar(x mat.Matrix) *mat.Dense {
-	// TODO(btracey): Parallelize
-	r, c := x.Dims()
-	n := len(g.outputs)
-	kStar := mat.NewDense(n, r, nil)
-	data := make([]float64, c)
-	for j := 0; j < r; j++ {
-		mat.Row(data, j, x)
-		for i := 0; i < n; i++ {
-			row := g.inputs.RawRowView(i)
-			v := g.kernel.Distance(row, data)
-			kStar.Set(i, j, v)
-		}
-	}
-	return kStar
-}
-
-// Train sets the paramters of the gaussian process. If noise == true,
-// the noise parameter is adjusted, otherwise it is not.
-// TODO(btracey): Need to implement barrier method for parameters. Steps get crazy.
-func (g *GP) Train(trainNoise bool) error {
-	// TODO(btracey): Implement a memory struct that can be passed around with
-	// all of this data.
-
-	ker := g.kernel.(OptimizableKernel)
-
-	initHyper := ker.Hyper(nil)
-	nKerHyper := len(initHyper)
-	if trainNoise {
-		initHyper = append(initHyper, math.Log(g.noise))
-	}
-
-	mem := newMargLikeMemory(len(initHyper), len(g.outputs))
-
-	f := func(x []float64) float64 {
-		fmt.Println("x =", x)
-		obj := g.marginalLikelihood(x, trainNoise, mem)
-		fmt.Println("obj =", obj)
-		return obj
-	}
-	df := func(x, grad []float64) {
-		g.marginalLikelihoodDerivative(x, grad, trainNoise, mem)
-		fmt.Println("x = ", x)
-		fmt.Println("grad = ", grad)
-	}
-
-	//	grad =  [0.4500442759224154 -3.074041876494095 0.42568788880060204]
-	/*
-		x := []float64{0.7287793210009457, -0.9371471942974932, -14.017213937483529}
-		fofx := f(x)
-		fmt.Println("fofx", fofx)
-
-		set := fd.DefaultSettings()
-		set.Method.Step = 1e-4
-		fdGrad := fd.Gradient(nil, f, x, nil)
-		fmt.Println("fd grad = ", fdGrad)
-		grad := make([]float64, len(fdGrad))
-		df(x, grad)
-		fmt.Println("real grad = ", grad)
-		os.Exit(1)
-	*/
-
-	problem := optimize.Problem{
-		Func: f,
-		Grad: df,
-	}
-	settings := optimize.DefaultSettings()
-	settings.GradientThreshold = 1e-4
-	result, err := optimize.Local(problem, initHyper, settings, nil)
-	// set noise
-	g.noise = math.Exp(result.X[len(result.X)-1])
-	ker.SetHyper(result.X[:nKerHyper])
-	g.setKernelMat(g.k, g.noise)
-	ok := g.cholK.Factorize(g.k)
-	if !ok {
-		return errors.New("gp: final kernel matrix is not positive definite")
-	}
-	v := mat.NewVecDense(len(g.outputs), g.outputs)
-	g.cholK.SolveVec(g.sigInvY, v)
-	//g.sigInvY.SolveCholeskyVec(g.cholK, v)
-	return err
-}
-
-type margLikeMemory struct {
-	lastX []float64
-	// likelihood only
-	k     *mat.SymDense
-	chol  *mat.Cholesky
-	alpha *mat.VecDense
-	tmp   *mat.VecDense
-	// For derivative
-	dKdTheta []*mat.SymDense
-	kInvDK   *mat.Dense
-}
-
-func newMargLikeMemory(hyper, outputs int) *margLikeMemory {
-	m := &margLikeMemory{
-		lastX:    make([]float64, hyper),
-		k:        mat.NewSymDense(outputs, nil),
-		chol:     &mat.Cholesky{},
-		alpha:    mat.NewVecDense(outputs, nil),
-		tmp:      mat.NewVecDense(1, nil),
-		dKdTheta: make([]*mat.SymDense, hyper),
-		kInvDK:   mat.NewDense(outputs, outputs, nil),
-	}
-	for i := 0; i < hyper; i++ {
-		m.dKdTheta[i] = mat.NewSymDense(outputs, nil)
-	}
-	return m
-}
-
-// marginalLikelihood computes the negative marginal likelihood of the data with the
-// given hyperparameters.
-func (g *GP) marginalLikelihood(x []float64, trainNoise bool, mem *margLikeMemory) float64 {
-
-	// TODO(btracey): Find a less hack-y way to introduce bounds.
-	ker := g.kernel.(OptimizableKernel)
-	nHyper := ker.NumHyper()
-
-	// If the parameters are outside the bounds introduce a quadratic penalty method
-	var barrier float64
-	bounds := ker.Bounds()
-	if trainNoise {
-		bounds = append(bounds, Bound{minLogNoise, maxLogNoise})
-	}
-
-	for i, v := range x {
-		if v < bounds[i].Min {
-			barrier += math.Pow(v-bounds[i].Min, barrierPow)
-		}
-		if v > bounds[i].Max {
-			barrier += math.Pow(v-bounds[i].Max, barrierPow)
-		}
-	}
-	//fmt.Println("barrier = ", barrier)
-
+// NegativeLikelihood computes the negative marginal likelihood of the data with
+// the given hyperparameters. The negative likelihood is returned so the best
+// value is the minimum of the function.
+func (m LikelihoodGP) NegativeLikelihood(hyper []float64) float64 {
+	// The marginal likelihood is.
 	// log[p(y|x,theta)] =
-	//      -1/2 y^T * K_y^-1 * y -1/2 log |K_y| - n/2 * log(2*pi)
-	// Want to maximize probability. Multiply by -2 to minimize and simplify,
-	// and ignore constant
-	// 		y^T * K_y^-1 * y + log |K_y|
-	// alpha = K_y^-1 * y
-	n := len(g.outputs)
-	copy(mem.lastX, x)
-	k := mem.k
-	chol := mem.chol
-	alpha := mem.alpha
-	tmp := mem.tmp
+	//      -1/2 y^T * K_y^-1 * y - 1/2*log |K_y| - n/2 * log(2*pi)
+	// which is the same thing as the log probability of the y vector for a
+	// normal distribution with mean 0 and covariance K_y.
 
-	y := mat.NewVecDense(n, g.outputs)
-	var noise float64
-	if trainNoise {
-		noise = math.Exp(x[len(x)-1])
-	} else {
-		noise = g.noise
+	r, _ := m.X.Dims()
+	if r != len(m.Y) {
+		panic(dataLengthMismatch)
 	}
-	ker.SetHyper(x[:nHyper])
-	g.setKernelMat(k, noise)
-	ok := chol.Factorize(k)
+	ker := kernel.LogKernelWrapper{
+		Hyper:       hyper,
+		LogKerneler: m.Kernel,
+	}
+	ky := kernelMatrixSym(nil, m.X, m.MeanX, m.StdX, ker, m.Noise)
+	mu := make([]float64, r)
+	norm, ok := distmv.NewNormal(mu, ky, nil)
 	if !ok {
-		// The kernel matrix is singular. Don't let it be
+		fmt.Println("not pos def")
 		return math.Inf(1)
 	}
-	chol.SolveVec(alpha, y)
-	//alpha.SolveCholeskyVec(chol, y)
-	// TODO(btracey): add mat.Dot(*Vector, *Vector)
-	tmp.MulVec(y.T(), alpha)
-	r, c := tmp.Dims()
-	if r != 1 || c != 1 {
-		panic("tmp bad size")
-	}
-	/*
-		var logdet float64
-		for i := 0; i < n; i++ {
-			logdet += 2 * math.Log(chol.At(i, i))
-		}
-	*/
-	logdet := chol.LogDet()
-	// This is proportional to negative likelihood.
-	// Divide by the number of samples to make the barrier penalty
-	// the same regardless of data size.
-	negLogLike := (tmp.At(0, 0) + logdet) / float64(n)
-	return negLogLike + barrier
+
+	yScale := scaleY(nil, m.Y, m.MeanY, m.StdY)
+	likeNorm := norm.LogProb(yScale)
+	return -likeNorm
 }
 
-func (g *GP) marginalLikelihoodDerivative(x, grad []float64, trainNoise bool, mem *margLikeMemory) {
-	// d/dTheta_j log[(p|X,theta)] =
-	//		1/2 * y^T * K^-1 dK/dTheta_j * K^-1 * y - 1/2 * tr(K^-1 * dK/dTheta_j)
-	//		1/2 * α^T * dK/dTheta_j * α - 1/2 * tr(K^-1 dK/dTheta_j)
-	// Multiply by the same -2
-	//		-α^T * K^-1 * α + tr(K^-1 dK/dTheta_j)
-	// This first computation is an inner product.
-	ker := g.kernel.(OptimizableKernel)
-	n := len(g.outputs)
-	nHyper := ker.NumHyper()
-	k := mem.k
-	chol := mem.chol
-	alpha := mem.alpha
-	dKdTheta := mem.dKdTheta
-	kInvDK := mem.kInvDK
-
-	y := mat.NewVecDense(n, g.outputs)
-
-	var noise float64
-	if trainNoise {
-		noise = math.Exp(x[len(x)-1])
-	} else {
-		noise = g.noise
-	}
-
-	// If x is the same, then reuse what has been computed in the function.
-	if !floats.Equal(mem.lastX, x) {
-		copy(mem.lastX, x)
-		ker.SetHyper(x[:nHyper])
-		g.setKernelMat(k, noise)
-		//chol.Cholesky(k, false)
-		chol.Factorize(k)
-		chol.SolveVec(alpha, y)
-		//alpha.SolveCholeskyVec(chol, y)
-	}
-	g.setKernelMatDeriv(dKdTheta, trainNoise, noise)
-	for i := range dKdTheta {
-		chol.Solve(kInvDK, dKdTheta[i])
-		//kInvDK.SolveCholesky(chol, dKdTheta[i])
-		inner := mat.Inner(alpha, dKdTheta[i], alpha)
-		grad[i] = -inner + mat.Trace(kInvDK)
-	}
-	floats.Scale(1/float64(n), grad)
-
-	bounds := ker.Bounds()
-	if trainNoise {
-		bounds = append(bounds, Bound{minLogNoise, maxLogNoise})
-	}
-	barrierGrad := make([]float64, len(grad))
-	for i, v := range x {
-		// Quadratic barrier penalty.
-		if v < bounds[i].Min {
-			diff := bounds[i].Min - v
-			barrierGrad[i] = -(barrierPow) * math.Pow(diff, barrierPow-1)
-		}
-		if v > bounds[i].Max {
-			diff := v - bounds[i].Max
-			barrierGrad[i] = (barrierPow) * math.Pow(diff, barrierPow-1)
-		}
-	}
-	fmt.Println("noise, minNoise", x[len(x)-1], bounds[len(x)-1].Min)
-	fmt.Println("barrier Grad", barrierGrad)
-	floats.Add(grad, barrierGrad)
-	//copy(grad, barrierGrad)
-}
-
-func (gp *GP) setKernelMat(s *mat.SymDense, noise float64) {
-	n := s.Symmetric()
-	for i := 0; i < n; i++ {
-		for j := i; j < n; j++ {
-			v := gp.kernel.Distance(
-				gp.inputs.RawRowView(i),
-				gp.inputs.RawRowView(j),
-			)
-			if i == j {
-				v += noise
-			}
-			s.SetSym(i, j, v)
-		}
-	}
-}
-
-func (gp *GP) setKernelMatDeriv(dKdTheta []*mat.SymDense, trainNoise bool, noise float64) {
-	ker := gp.kernel.(OptimizableKernel)
-	n := len(gp.outputs)
-	nHyper := ker.NumHyper()
-	dk := make([]float64, nHyper)
-	for i := 0; i < n; i++ {
-		for j := i; j < n; j++ {
-			one := gp.inputs.RawRowView(i)
-			two := gp.inputs.RawRowView(j)
-			ker.DistanceDHyper(one, two, dk)
-			for k := 0; k < nHyper; k++ {
-				dKdTheta[k].SetSym(i, j, dk[k])
-			}
-			if trainNoise {
-				if i != j {
-					// Noise is only added on the diagonal, so zero derivative elsewhere.
-					dKdTheta[nHyper].SetSym(i, j, 0)
-				} else {
-					// The derivative of the actual noise is one, but the optimization
-					// is on the log of the noise.
-					// df/dlogx = df/dx * dx/dlogx
-					//			= df/dx * (1/(dlogx/dx))
-					//			= df/dx * (1/(1/x)) = x * df/dx = x
-					dKdTheta[nHyper].SetSym(i, j, noise)
-				}
-			}
-		}
-	}
-}
+// Have a TrainGP function
 
 /*
-// PredictCov predicts the covariance of the outputs at a single point x.
-// y is outputDim x outputDim. If y == nil, a new matrix is allocated.
-func (gp *GP) PredictCov(y *mat.SymDense, x []float64) *mat.SymDense {
-
-}
-*/
-
-/*
-// Update updates the values of the kernel hyperparameters
-func (g *Gp) TrainHyper() {
-	// Maximum likelihood estimation. See
-	// https://github.com/aerialhedgehog/VyPy/blob/master/trunk/VyPy/regression/gpr/learning/Likelihood.py
-
-	// Need to do initialization. Possibily computing distances.
-	// Definitely need to rescale the y points for a new mean and variance.
-
-	// Optimize and then set the noise parameter
-}
-*/
-
-// need predict with stddev
-
-/*
-
-// LogKernelDist returns the log of the distance
-func (kernel SqExpIso) LogDistance(dist float64) float64 {
-	logDist := math.Log(dist)
-	distOverVariance := math.Exp(logDist - kernel.LogVariance)
-	return -0.5*distOverVariance*distOverVariance + 2*kernel.LogLength
+// Mean returns the mean predictions for the locations at xnew given the cholesky
+// decomposition of the kernel matrix. Stores the result into yNew.
+func Mean(y []float64, k mat.Matrix, kInvY []float64) []float64 {
+	// Mean is k xx' * K^-1 * y
+	m, n := k.Dims()
+	n2 := len(kInvY)
+	if n != n2 {
+		panic(badInputDim)
+	}
+	if y == nil {
+		y = make([]float64, m)
+	}
+	if len(y) != m {
+		panic(badStorageDim)
+	}
+	yVec := mat.NewVecDense(m, y)
+	kInvYVec := mat.NewVecDense(m, y)
+	yVec.MulVec(k, kInvYVec)
+	return y
 }
 
-func (kernel SqExpIso) Distance(dist )
+// KernelMatrix computes the kernel matrix between the samples in x and xprime.
+// The i,jth entry in the kernel mat is the kernel between x_i and x_j
+func KernelMatrix(k *mat.Dense, x, xprime mat.Matrix, ker kernel.Kerneler) *mat.Dense {
+	m, p := x.Dims()
+	n, p2 := xprime.Dims()
+	if p != p2 {
+		panic(badInputDim)
+	}
+	if k == nil {
+		k = mat.NewDense(m, n, nil)
+	}
+	mk, nk := k.Dims()
+	if mk != m || nk != n {
+		panic(badStorageDim)
+	}
+	xi := make([]float64, p)
+	xj := make([]float64, p)
+	for i := 0; i < m; i++ {
+		mat.Row(xi, i, x)
+		for j := 0; j < n; j++ {
+			mat.Row(xj, j, xprime)
+			v := kernel.Kernel(xi, xj)
+			k.Set(i, j, v)
+		}
+	}
+	return k
+}
 */
